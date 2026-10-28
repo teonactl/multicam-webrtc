@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>multicam-webrtc</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; min-height: 100vh; background: #0b0b0e; color: #eee; font-family: system-ui, sans-serif;
+         display: flex; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box; }
+  #wrap { max-width: 720px; width: 100%; }
+  h1 { font-size: 1.6rem; margin-bottom: 2px; }
+  p.sub { color: #888; margin-top: 0; }
+  #grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-top: 24px; }
+  a.card { display: block; text-decoration: none; color: inherit; background: #17171b; border: 1px solid #2a2a30;
+           border-radius: 12px; padding: 18px 20px; transition: border-color .15s, transform .15s; }
+  a.card:hover { border-color: #2d7dfa; transform: translateY(-1px); }
+  a.card .icon { font-size: 1.6rem; }
+  a.card h2 { font-size: 1.05rem; margin: 8px 0 4px; }
+  a.card p { margin: 0; color: #999; font-size: .85rem; line-height: 1.4; }
+  #camSection { margin-top: 28px; padding-top: 20px; border-top: 1px solid #2a2a30; }
+  #camSection h2 { font-size: .95rem; color: #aaa; font-weight: 600; margin-bottom: 8px; }
+  #camSection p { color: #777; font-size: .85rem; margin: 4px 0; }
+  #camSection code { background: #1c1c22; padding: 2px 6px; border-radius: 4px; font-size: .85rem; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>multicam-webrtc</h1>
+  <p class="sub">Telecamere da smartphone via browser → mix/composizione live sul PC.</p>
+
+  <div id="grid">
+    <a class="card" href="viewer.html">
+      <div class="icon">🎚️</div>
+      <h2>Mixer (switcher)</h2>
+      <p>Un riquadro grande + miniature cliccabili delle telecamere collegate. Pensato per un cambio rapido durante la diretta.</p>
+    </a>
+    <a class="card" href="compose.html">
+      <div class="icon">🧩</div>
+      <h2>Composizione</h2>
+      <p>Disegna tu a mano la disposizione dei riquadri sullo schermo, assegna una telecamera e un'azione al click a ciascuno.</p>
+    </a>
+    <a class="card" href="admin.html">
+      <div class="icon">⚙️</div>
+      <h2>Impostazioni</h2>
+      <p>Fotocamera di default, microfono, sfocatura volti, limite di quanti mixer possono collegarsi insieme.</p>
+    </a>
+    <a class="card" href="camera.html">
+      <div class="icon">📱</div>
+      <h2>Entra come telecamera</h2>
+      <p>Normalmente si apre dal telefono (via QR stampato in console) — ma funziona anche da qui per una prova rapida.</p>
+    </a>
+  </div>
+
+  <div id="camSection">
+    <h2>Per i telefoni</h2>
+    <p>Fai scansionare il QR stampato nel terminale dove gira <code>npm start</code>, oppure apri a mano <code>camera.html</code> dallo stesso indirizzo — sulla <strong>stessa rete WiFi</strong> di questo PC.</p>
+  </div>
+</div>
+</body>
+</html>

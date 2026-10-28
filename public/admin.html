@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Impostazioni — multicam-webrtc</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; }
+  #wrap { max-width: 480px; margin: 0 auto; padding: 28px 24px; }
+  h1 { font-size: 1.3rem; margin-bottom: 4px; }
+  p.hint { color: #888; font-size: .85rem; margin-top: 0; }
+  fieldset { border: 1px solid #333; border-radius: 10px; padding: 16px 18px; margin: 18px 0; }
+  legend { padding: 0 6px; color: #aaa; font-size: .85rem; }
+  label.radio, label.check { display: flex; align-items: center; gap: 10px; padding: 8px 0; cursor: pointer; }
+  label.radio input, label.check input { width: 18px; height: 18px; }
+  .desc { color: #888; font-size: .8rem; margin: 0 0 0 28px; }
+  #saveBtn { width: 100%; padding: 12px; font-size: 1rem; font-weight: 600; background: #2d7dfa; color: #fff;
+             border: none; border-radius: 8px; cursor: pointer; }
+  #saveBtn:active { background: #2466d1; }
+  #status { text-align: center; margin-top: 12px; font-size: .9rem; min-height: 1.2em; }
+  #status.ok { color: #4caf50; }
+  #status.err { color: #f44336; }
+  .beta { font-size: .7rem; background: #553; color: #fc6; padding: 1px 6px; border-radius: 4px; margin-left: 6px; }
+  #backLink { display: inline-block; color: #888; text-decoration: none; font-size: .85rem; margin-bottom: 14px; }
+  #backLink:hover { color: #eee; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <a id="backLink" href="index.html">← Home</a>
+  <h1>Impostazioni evento</h1>
+  <p class="hint">Si applicano ai telefoni che apriranno camera.html <strong>da ora in poi</strong> — chi è già collegato non viene interrotto (eccetto sfocatura volti, che può aggiornarsi subito).</p>
+
+  <fieldset>
+    <legend>Fotocamera di default</legend>
+    <label class="radio"><input type="radio" name="facingMode" value="environment"> Posteriore</label>
+    <label class="radio"><input type="radio" name="facingMode" value="user"> Frontale</label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Audio</legend>
+    <label class="check"><input type="checkbox" id="requireMicrophone"> Richiedi anche il microfono</label>
+    <p class="desc">Se disattivato, il telefono trasmette solo video (niente permesso microfono richiesto).</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Privacy</legend>
+    <label class="check"><input type="checkbox" id="blurFaces"> Sfoca i volti <span class="beta">beta</span></label>
+    <p class="desc">Richiede il supporto del browser alla rilevazione volti (Chrome/Android affidabile, Safari/iOS spesso non supportato — in quel caso l'opzione non ha effetto su quel telefono). Elabora sul telefono stesso, aumenta il carico sulla batteria/CPU.</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Mixer</legend>
+    <label class="check"><input type="checkbox" id="allowMultipleMixers"> Consenti più mixer collegati insieme</label>
+    <p class="desc">Di default solo un mixer (viewer.html o compose.html) alla volta può collegarsi — chi arriva in più vede un avviso. Attivalo solo se davvero più persone devono poter scegliere cosa mandare in diretta insieme.</p>
+  </fieldset>
+
+  <button id="saveBtn">Salva</button>
+  <div id="status"></div>
+</div>
+
+<script>
+'use strict';
+
+async function loadSettings() {
+  const res = await fetch('/api/settings');
+  const s = await res.json();
+  document.querySelector(`input[name="facingMode"][value="${s.defaultFacingMode}"]`).checked = true;
+  document.getElementById('requireMicrophone').checked = s.requireMicrophone;
+  document.getElementById('blurFaces').checked = s.blurFaces;
+  document.getElementById('allowMultipleMixers').checked = s.allowMultipleMixers;
+}
+
+document.getElementById('saveBtn').addEventListener('click', async () => {
+  const statusEl = document.getElementById('status');
+  const payload = {
+    defaultFacingMode: document.querySelector('input[name="facingMode"]:checked').value,
+    requireMicrophone: document.getElementById('requireMicrophone').checked,
+    blurFaces: document.getElementById('blurFaces').checked,
+    allowMultipleMixers: document.getElementById('allowMultipleMixers').checked,
+  };
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error('risposta ' + res.status);
+    statusEl.textContent = 'Salvato.';
+    statusEl.className = 'ok';
+  } catch (err) {
+    statusEl.textContent = 'Errore nel salvataggio: ' + err.message;
+    statusEl.className = 'err';
+  }
+});
+
+loadSettings();
+</script>
+</body>
+</html>

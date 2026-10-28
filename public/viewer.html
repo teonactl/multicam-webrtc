@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mixer — multicam-webrtc</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
+  /* Regola generica: senza questa, .hidden su #program/#programLabel/
+     #noProgram/#unmuteBtn non aveva ALCUN effetto visivo (esistevano solo
+     le regole più specifiche #tray.hidden e #toolbar.hidden) — bug reale
+     osservato: il testo "In attesa di una telecamera…" restava visibile
+     sopra il video anche a programma avviato. */
+  .hidden { display: none !important; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  /* min-height:0 è essenziale qui: un <video> dentro un contenitore flex
+     non si restringe mai sotto la sua dimensione "naturale" per default
+     (comportamento min-height:auto standard dei figli flex) — senza
+     questa riga il video si prendeva TUTTO lo spazio verticale disponibile
+     e spingeva #tray fuori dalla vista nonostante il suo min-height:120px
+     (bug osservato: "non appaiono le miniature", in realtà schiacciate a
+     zero/oltre il bordo, mai realmente invisibili per un toggle). */
+  #program-wrap { flex: 1; min-height: 0; position: relative; background: #000; display: flex; align-items: center; justify-content: center; }
+  #program { max-width: 100%; max-height: 100%; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #programLabel { position: absolute; top: 10px; left: 14px; background: rgba(0,0,0,.55); padding: 4px 10px;
+                  border-radius: 6px; font-size: .9rem; }
+  /* bottom-right (non top-right): lì c'è già il #toolbar fisso, posizionare
+     anche questo pulsante in alto a destra lo faceva sovrapporre. */
+  #unmuteBtn { position: absolute; bottom: 14px; right: 14px; background: rgba(0,0,0,.6); color: #eee;
+               border: 1px solid #555; border-radius: 6px; padding: 6px 12px; font-size: .85rem; cursor: pointer; }
+  #noProgram { color: #666; font-size: 1.1rem; }
+  #tray { display: flex; gap: 10px; padding: 10px; background: #0b0b0b; overflow-x: auto; min-height: 120px; }
+  .tile { position: relative; flex: 0 0 auto; width: 180px; height: 101px; border-radius: 8px; overflow: hidden;
+          border: 2px solid #333; cursor: pointer; background: #000; }
+  .tile.active { border-color: #2d7dfa; }
+  .tile video { width: 100%; height: 100%; object-fit: cover; }
+  .tile .label { position: absolute; bottom: 2px; left: 4px; right: 4px; font-size: .72rem;
+                 background: rgba(0,0,0,.6); padding: 1px 5px; border-radius: 4px; overflow: hidden;
+                 text-overflow: ellipsis; white-space: nowrap; }
+  #toolbar { position: fixed; top: 8px; right: 8px; z-index: 10; display: flex; gap: 6px; }
+  #toolbar button, #toolbar a { background: rgba(0,0,0,.6); color: #eee; border: 1px solid #444; border-radius: 6px;
+                     padding: 6px 10px; font-size: .8rem; cursor: pointer; text-decoration: none; box-sizing: border-box; }
+  #rejectedOverlay { position: fixed; inset: 0; background: #0b0b0e; z-index: 200; display: flex;
+                      flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 24px; }
+  #rejectedOverlay h1 { font-size: 1.3rem; margin-bottom: 8px; }
+  #rejectedOverlay p { color: #999; max-width: 420px; }
+  #rejectedOverlay a { margin-top: 18px; color: #2d7dfa; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <a href="index.html">← Home</a>
+  <button id="toggleTrayBtn">Nascondi miniature (per OBS/proiezione)</button>
+  <button id="fullscreenBtn">Schermo intero</button>
+</div>
+
+<div id="rejectedOverlay" class="hidden">
+  <h1>Un altro mixer è già collegato</h1>
+  <p>Questo progetto è impostato per un solo mixer alla volta. Chiudi l'altra scheda/pagina Mixer o Composizione, oppure permetti più mixer insieme in Impostazioni.</p>
+  <a href="index.html">← Torna alla Home</a>
+</div>
+
+<div id="app">
+  <div id="program-wrap">
+    <span id="noProgram">In attesa di una telecamera… (apri camera.html su un telefono sulla stessa WiFi)</span>
+    <video id="program" autoplay playsinline muted class="hidden"></video>
+    <span id="programLabel" class="hidden"></span>
+    <button id="unmuteBtn" class="hidden">🔇 Attiva audio</button>
+  </div>
+  <div id="tray"></div>
+</div>
+
+<script>
+'use strict';
+
+const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+const trayEl = document.getElementById('tray');
+const programEl = document.getElementById('program');
+const programLabelEl = document.getElementById('programLabel');
+const noProgramEl = document.getElementById('noProgram');
+const unmuteBtn = document.getElementById('unmuteBtn');
+
+let ws;
+const cameras = new Map(); // id -> { pc, name, stream, tileEl }
+let programId = null;
+
+function send(msg) { if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg)); }
+
+function setProgram(id) {
+  const cam = cameras.get(id);
+  console.log('[mixer] setProgram chiamato per', id, '— trovato in cameras:', !!cam, '— stream pronto:', !!cam?.stream);
+  if (!cam || !cam.stream) return;
+  programId = id;
+  programEl.srcObject = cam.stream;
+  programEl.classList.remove('hidden');
+  programLabelEl.textContent = cam.name;
+  programLabelEl.classList.remove('hidden');
+  unmuteBtn.classList.remove('hidden');
+  noProgramEl.classList.add('hidden');
+  for (const c of cameras.values()) c.tileEl?.classList.remove('active');
+  cam.tileEl?.classList.add('active');
+  // Il browser blocca l'autoplay di un video NON mutato senza un gesto
+  // dell'utente: si parte sempre mutati (play() garantito) e si lascia
+  // all'utente attivare l'audio col pulsante — altrimenti il video resta
+  // fermo sul primo fotogramma decodificato (bug osservato: "vedo solo il
+  // primo fotogramma e poi rimane così").
+  programEl.play().catch((err) => console.warn('Program play() bloccato:', err));
+}
+
+unmuteBtn.addEventListener('click', () => {
+  programEl.muted = !programEl.muted;
+  unmuteBtn.textContent = programEl.muted ? '🔇 Attiva audio' : '🔊 Disattiva audio';
+  if (!programEl.muted) programEl.play().catch((err) => console.warn('Program play() bloccato:', err));
+});
+
+function addTile(id, name) {
+  const tile = document.createElement('div');
+  tile.className = 'tile';
+  tile.innerHTML = `<video autoplay playsinline muted></video><span class="label">${name}</span>`;
+  tile.addEventListener('click', () => setProgram(id));
+  trayEl.appendChild(tile);
+  return tile;
+}
+
+async function connectToCamera(id, name) {
+  console.log('[mixer] nuova telecamera annunciata:', id, name);
+  const pc = new RTCPeerConnection(rtcConfig);
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+
+  const tileEl = addTile(id, name);
+  cameras.set(id, { pc, name, stream: null, tileEl });
+
+  pc.onicecandidate = (e) => { if (e.candidate) send({ type: 'ice-candidate', to: id, candidate: e.candidate }); };
+  pc.onconnectionstatechange = () => console.log('[mixer] camera', id, 'connectionState =', pc.connectionState);
+  pc.oniceconnectionstatechange = () => console.log('[mixer] camera', id, 'iceConnectionState =', pc.iceConnectionState);
+
+  pc.ontrack = (e) => {
+    console.log('[mixer] ontrack ricevuto da camera', id, '— kind:', e.track.kind, '— streams:', e.streams.length);
+    const cam = cameras.get(id);
+    if (!cam) return;
+    cam.stream = e.streams[0];
+    const videoEl = cam.tileEl.querySelector('video');
+    videoEl.srcObject = cam.stream;
+    videoEl.play().catch(() => {}); // già mutato nel markup: l'autoplay non dovrebbe essere bloccato, ma alcuni browser vogliono comunque la chiamata esplicita
+    // La prima telecamera che arriva diventa automaticamente il Program,
+    // così c'è sempre qualcosa da vedere/proiettare senza un click in più.
+    if (programId === null) setProgram(id);
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  send({ type: 'offer', to: id, sdp: pc.localDescription });
+}
+
+function removeCamera(id) {
+  const cam = cameras.get(id);
+  if (!cam) return;
+  cam.pc.close();
+  cam.tileEl?.remove();
+  cameras.delete(id);
+  if (programId === id) {
+    programId = null;
+    programEl.classList.add('hidden');
+    programLabelEl.classList.add('hidden');
+    unmuteBtn.classList.add('hidden');
+    noProgramEl.classList.remove('hidden');
+    const next = cameras.keys().next();
+    if (!next.done) setProgram(next.value);
+  }
+}
+
+function connectSignaling() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => send({ type: 'join', role: 'viewer', room: 'main' });
+
+  ws.onclose = () => {
+    noProgramEl.textContent = 'Connessione al server persa — ricarica la pagina';
+    noProgramEl.classList.remove('hidden');
+  };
+
+  ws.onmessage = async (ev) => {
+    const msg = JSON.parse(ev.data);
+
+    if (msg.type === 'camera-joined') connectToCamera(msg.id, msg.name);
+    if (msg.type === 'camera-left') removeCamera(msg.id);
+
+    if (msg.type === 'join-rejected') {
+      // Il server ha rifiutato questo client come mixer (limite di un
+      // mixer alla volta, vedi admin.html) — non si tenta nulla di WebRTC,
+      // si mostra solo il messaggio e si chiude la connessione: niente
+      // riconnessione automatica (ritenterebbe subito, inutilmente).
+      document.getElementById('rejectedOverlay').classList.remove('hidden');
+      ws.close();
+    }
+
+    if (msg.type === 'answer') {
+      const cam = cameras.get(msg.from);
+      if (cam) await cam.pc.setRemoteDescription(msg.sdp);
+    }
+    if (msg.type === 'ice-candidate') {
+      const cam = cameras.get(msg.from);
+      if (cam) { try { await cam.pc.addIceCandidate(msg.candidate); } catch (_) {} }
+    }
+  };
+}
+
+const toggleTrayBtn = document.getElementById('toggleTrayBtn');
+toggleTrayBtn.addEventListener('click', () => {
+  const nowHidden = trayEl.classList.toggle('hidden');
+  toggleTrayBtn.textContent = nowHidden ? 'Mostra miniature' : 'Nascondi miniature (per OBS/proiezione)';
+});
+document.getElementById('fullscreenBtn').addEventListener('click', () => {
+  document.documentElement.requestFullscreen?.();
+});
+
+connectSignaling();
+</script>
+</body>
+</html>

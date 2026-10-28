@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Telecamera — multicam-webrtc</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; }
+  #setup { padding: 24px; max-width: 420px; margin: 0 auto; }
+  #setup h1 { font-size: 1.2rem; }
+  input, button { font-size: 1rem; padding: 10px 14px; border-radius: 8px; border: 1px solid #444; }
+  input { width: 100%; box-sizing: border-box; margin-bottom: 12px; background: #1c1c1c; color: #eee; }
+  button { width: 100%; background: #2d7dfa; color: #fff; border: none; font-weight: 600; }
+  button:active { background: #2466d1; }
+  #preview-wrap { position: relative; width: 100%; height: 100vh; background: #000; }
+  video#preview { width: 100%; height: 100%; object-fit: cover; }
+  #status { position: absolute; top: 0; left: 0; right: 0; padding: 10px 14px; background: rgba(0,0,0,.5);
+            font-size: .85rem; display: flex; justify-content: space-between; }
+  #switchBtn { position: absolute; bottom: 20px; right: 20px; width: auto; padding: 12px 16px; background: rgba(0,0,0,.6); }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+
+<div id="setup">
+  <h1>Entra come telecamera</h1>
+  <p style="opacity:.75">Il video resta sul telefono: viene inviato direttamente (peer-to-peer) al mixer sul PC, nessun upload su internet.</p>
+  <input id="nameInput" placeholder="Il tuo nome (visibile sul mixer)" maxlength="40">
+  <button id="startBtn">Avvia la telecamera</button>
+</div>
+
+<div id="preview-wrap" class="hidden">
+  <video id="preview" autoplay playsinline muted></video>
+  <div id="status">
+    <span id="statusText">Connessione…</span>
+    <span id="peerCount">0 mixer collegati</span>
+  </div>
+  <button id="switchBtn">Cambia fotocamera</button>
+</div>
+
+<script>
+'use strict';
+
+const rtcConfig = {
+  // STUN pubblico, serve solo a scoprire l'indirizzo esterno se il NAT lo
+  // richiede — l'audio/video continua a viaggiare in LAN. Se l'evento non
+  // ha accesso a internet, questo fallisce silenziosamente e WebRTC usa
+  // comunque le candidate "host" locali: va bene lo stesso sulla stessa WiFi.
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+};
+
+const setupEl = document.getElementById('setup');
+const previewWrapEl = document.getElementById('preview-wrap');
+const previewEl = document.getElementById('preview');
+const statusText = document.getElementById('statusText');
+const peerCount = document.getElementById('peerCount');
+const nameInput = document.getElementById('nameInput');
+
+let ws;
+let rawStream;    // stream grezzo da getUserMedia (video+eventuale audio)
+let outputStream; // ciò che viene davvero inviato: rawStream, o la versione sfocata
+let facingMode = 'environment';
+let settings = { defaultFacingMode: 'environment', requireMicrophone: true, blurFaces: false };
+const peerConnections = new Map(); // viewerId -> RTCPeerConnection
+
+function send(msg) { if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg)); }
+
+function updatePeerCount() {
+  peerCount.textContent = `${peerConnections.size} mixer collegati`;
+}
+
+async function loadSettings() {
+  try {
+    const res = await fetch('/api/settings');
+    settings = await res.json();
+    facingMode = settings.defaultFacingMode || 'environment';
+  } catch (_) {
+    // Server irraggiungibile per /api/settings (non dovrebbe succedere,
+    // stesso host di questa pagina): si prosegue con i valori di default
+    // già impostati sopra, meglio di bloccare l'ingresso in sala.
+  }
+}
+
+// Una causa molto comune di "la telecamera si disconnette da sola" sui
+// telefoni: il browser sospende/chiude pagine in background quando lo
+// schermo si blocca (specie iOS Safari). Il Wake Lock tiene lo schermo
+// acceso finché la telecamera è attiva — non è garantito su ogni browser
+// (fallisce silenziosamente dove non supportato), ma dove c'è aiuta molto.
+let wakeLock = null;
+async function requestWakeLock() {
+  try {
+    wakeLock = await navigator.wakeLock?.request('screen');
+  } catch (_) {
+    wakeLock = null; // non supportato o negato: si prosegue comunque, solo senza questa protezione
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  // Il Wake Lock si rilascia automaticamente quando la pagina va in
+  // background e va richiesto di nuovo al ritorno in primo piano.
+  if (document.visibilityState === 'visible' && rawStream) requestWakeLock();
+});
+
+// -----------------------------------------------------------------------
+// Sfocatura volti (beta): usa la Shape Detection API nativa del browser
+// (FaceDetector) — elaborazione interamente sul dispositivo, nessun
+// modello da scaricare da internet (importante: l'evento potrebbe non
+// avere accesso a internet). Disponibile solo su alcuni browser Chromium
+// (tipicamente Chrome/Android) — dove manca (es. Safari/iOS) la funzione
+// non ha alcun effetto, in modo silenzioso: non è un errore bloccante,
+// è un "best effort" dichiarato anche nella pagina impostazioni.
+// -----------------------------------------------------------------------
+
+let blurRAF = null;
+let blurCanvas = null;
+let blurVideo = null; // <video> nascosto che riproduce rawStream per poterlo disegnare nel canvas
+
+function stopBlurPipeline() {
+  if (blurRAF) cancelAnimationFrame(blurRAF);
+  blurRAF = null;
+  blurVideo?.pause();
+  blurVideo = null;
+  blurCanvas = null;
+}
+
+async function buildBlurredStream(source) {
+  if (!('FaceDetector' in window)) return null; // non supportato su questo browser: nessun effetto
+
+  const videoTrack = source.getVideoTracks()[0];
+  if (!videoTrack) return null;
+  const { width, height } = videoTrack.getSettings();
+
+  blurVideo = document.createElement('video');
+  blurVideo.srcObject = new MediaStream([videoTrack]);
+  blurVideo.muted = true;
+  blurVideo.playsInline = true;
+  await blurVideo.play();
+
+  blurCanvas = document.createElement('canvas');
+  blurCanvas.width = width || 1280;
+  blurCanvas.height = height || 720;
+  const ctx = blurCanvas.getContext('2d');
+
+  const detector = new FaceDetector({ fastMode: true, maxDetectedFaces: 6 });
+  let lastBoxes = [];
+  let frameCount = 0;
+
+  const loop = async () => {
+    if (!blurVideo) return; // pipeline fermata nel frattempo
+    ctx.drawImage(blurVideo, 0, 0, blurCanvas.width, blurCanvas.height);
+
+    // Rilevare i volti ad ogni frame sarebbe troppo costoso per un
+    // telefono: lo si fa ~5 volte al secondo e si riusano le posizioni
+    // nel frattempo — i volti non si spostano abbastanza velocemente da
+    // notare la differenza, ma il costo scende di molto.
+    if (frameCount++ % 6 === 0) {
+      try { lastBoxes = (await detector.detect(blurVideo)).map((f) => f.boundingBox); } catch (_) { /* un frame saltato non è un problema */ }
+    }
+
+    for (const box of lastBoxes) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(box.x, box.y, box.width, box.height);
+      ctx.clip();
+      ctx.filter = 'blur(20px)';
+      ctx.drawImage(blurVideo, 0, 0, blurCanvas.width, blurCanvas.height);
+      ctx.restore();
+    }
+
+    blurRAF = requestAnimationFrame(loop);
+  };
+  loop();
+
+  const outStream = blurCanvas.captureStream(25);
+  const audioTrack = source.getAudioTracks()[0];
+  if (audioTrack) outStream.addTrack(audioTrack);
+  return outStream;
+}
+
+// Ricostruisce outputStream da rawStream applicando (o no) la sfocatura
+// secondo le impostazioni correnti, e sostituisce la traccia video in
+// tutte le RTCPeerConnection già aperte — così attivare/disattivare la
+// sfocatura da admin.html si vede subito, senza dover ricollegare.
+async function applyBlurSetting() {
+  stopBlurPipeline();
+  outputStream = settings.blurFaces ? (await buildBlurredStream(rawStream)) || rawStream : rawStream;
+  previewEl.srcObject = outputStream;
+
+  const newVideoTrack = outputStream.getVideoTracks()[0];
+  for (const pc of peerConnections.values()) {
+    const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+    if (sender && newVideoTrack) sender.replaceTrack(newVideoTrack);
+  }
+}
+
+let reconnectTimer = null;
+
+async function getCameraStream(mode) {
+  return navigator.mediaDevices.getUserMedia({
+    video: { facingMode: mode, width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: settings.requireMicrophone,
+  });
+}
+
+async function startCamera() {
+  await loadSettings();
+  facingMode = settings.defaultFacingMode || 'environment';
+  rawStream = await getCameraStream(facingMode);
+  await applyBlurSetting();
+  setupEl.classList.add('hidden');
+  previewWrapEl.classList.remove('hidden');
+  requestWakeLock();
+  connectSignaling();
+}
+
+function connectSignaling() {
+  clearTimeout(reconnectTimer);
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => {
+    statusText.textContent = 'In attesa del mixer…';
+    send({ type: 'join', role: 'camera', room: 'main', name: nameInput.value || undefined });
+  };
+
+  ws.onclose = () => {
+    // Riconnessione automatica (es. dopo che lo schermo si è bloccato o la
+    // WiFi ha avuto un intoppo) invece di richiedere una ricarica manuale
+    // della pagina — bug osservato: "vedo solo la prima telecamera" era
+    // in parte proprio questo, connessioni che cadevano e non tornavano su
+    // da sole. Le RTCPeerConnection verso i mixer precedenti sono ormai
+    // morte comunque (il mixer le rimuove alla chiusura del WebSocket):
+    // si ripulisce la mappa, arriveranno nuove offer dopo il rejoin.
+    for (const pc of peerConnections.values()) pc.close();
+    peerConnections.clear();
+    updatePeerCount();
+    statusText.textContent = 'Connessione persa, riconnessione…';
+    reconnectTimer = setTimeout(connectSignaling, 2000);
+  };
+
+  ws.onmessage = async (ev) => {
+    const msg = JSON.parse(ev.data);
+
+    if (msg.type === 'offer') {
+      let pc = peerConnections.get(msg.from);
+      if (!pc) {
+        pc = new RTCPeerConnection(rtcConfig);
+        peerConnections.set(msg.from, pc);
+        outputStream.getTracks().forEach((t) => pc.addTrack(t, outputStream));
+        pc.onicecandidate = (e) => { if (e.candidate) send({ type: 'ice-candidate', to: msg.from, candidate: e.candidate }); };
+        pc.onconnectionstatechange = () => {
+          statusText.textContent = `Mixer: ${pc.connectionState}`;
+          if (['closed', 'failed', 'disconnected'].includes(pc.connectionState)) {
+            peerConnections.delete(msg.from);
+            updatePeerCount();
+          } else {
+            updatePeerCount();
+          }
+        };
+      }
+      await pc.setRemoteDescription(msg.sdp);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      send({ type: 'answer', to: msg.from, sdp: pc.localDescription });
+    }
+
+    if (msg.type === 'ice-candidate') {
+      const pc = peerConnections.get(msg.from);
+      if (pc) { try { await pc.addIceCandidate(msg.candidate); } catch (_) {} }
+    }
+
+    if (msg.type === 'settings-updated') {
+      const blurChanged = msg.settings.blurFaces !== settings.blurFaces;
+      settings = msg.settings;
+      if (blurChanged && rawStream) await applyBlurSetting();
+    }
+  };
+}
+
+document.getElementById('startBtn').addEventListener('click', () => {
+  startCamera().catch((err) => alert('Impossibile accedere alla fotocamera: ' + err.message));
+});
+
+// Solo per test di carico automatizzati (vedi loadtest.js): ?autostart=1
+// salta il tocco su "Avvia la telecamera" — un utente reale non passa mai
+// questo parametro, quindi non cambia nulla nell'uso normale dell'app.
+const qp = new URLSearchParams(location.search);
+if (qp.get('autostart') === '1') {
+  if (qp.get('name')) nameInput.value = qp.get('name');
+  startCamera().catch((err) => console.error('autostart fallito:', err));
+}
+
+document.getElementById('switchBtn').addEventListener('click', async () => {
+  facingMode = facingMode === 'environment' ? 'user' : 'environment';
+  const oldRaw = rawStream;
+  rawStream = await getCameraStream(facingMode);
+  await applyBlurSetting();
+  oldRaw.getTracks().forEach((t) => t.stop());
+});
+</script>
+</body>
+</html>
